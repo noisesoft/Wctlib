@@ -37,6 +37,9 @@ func (s *StreamSession) runReceive(ctx context.Context) {
 				s.done()
 				return
 			}
+			if frame.Offset < s.checkpoint.LastOffset {
+				continue
+			}
 			s.handleReceiveFrame(ctx, frame)
 		}
 	}
@@ -44,6 +47,26 @@ func (s *StreamSession) runReceive(ctx context.Context) {
 
 func (s *StreamSession) handleReceiveFrame(ctx context.Context, frame types.Frame) {
 	if s.request.Sink != nil {
+		if frame.Payload == nil {
+			s.fail(errors.New("receive payload is nil"))
+			return
+		}
+		wait := s.ioLimit.mustWait(len(frame.Payload))
+		if wait > 0 {
+			s.metrics.Observe("io_wait_ms", float64(wait.Milliseconds()), telemetry.Labels{
+				"stream_id":  s.streamID,
+				"session_id": s.id,
+				"adapter":    s.adapterName,
+			})
+			timer := time.NewTimer(wait)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				s.fail(ctx.Err())
+				return
+			case <-timer.C:
+			}
+		}
 		if _, err := s.request.Sink.Write(frame.Payload); err != nil {
 			s.fail(err)
 			return

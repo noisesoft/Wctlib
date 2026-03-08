@@ -1,33 +1,38 @@
 package grpcadapter
 
 import (
-	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
-	"strconv"
+	"errors"
+	"net"
+	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/noisesoft/Wctlib/pkg/wctlib/adapter"
 	"github.com/noisesoft/Wctlib/pkg/wctlib/types"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 )
 
 const (
-	adapterID   = "grpc"
-	defaultPath = "/wctlib/grpc"
+	adapterID      = "grpc"
+	grpcServiceID  = "wctlib.StreamTransport"
+	grpcMethodPath = "/wctlib.StreamTransport/PushFrame"
 )
 
-var defaultClient = &http.Client{Timeout: 8 * time.Second}
+var defaultCodec = grpcJSONCodec{}
 
 type Adapter struct {
 	upstream string
-	client   *http.Client
 }
 
 func New(upstream string) *Adapter {
-	return &Adapter{upstream: upstream, client: defaultClient}
+	return &Adapter{upstream: upstream}
 }
 
 func (a *Adapter) ID() string      { return adapterID }
@@ -57,33 +62,31 @@ func (a *Adapter) OpenInbound(_ context.Context, cfg adapter.AdapterConfig) (ada
 	if cfg.Request.Metadata["grpc.listen"] == "" {
 		return nil, adapter.Error{Adapter: adapterID, Code: adapter.ErrCodeUnsupported, Reason: "missing grpc.listen metadata", Err: nil}
 	}
-	if a.client == nil {
-		a.client = defaultClient
-	}
-	path := cfg.Request.Metadata["grpc.path"]
-	if path == "" {
-		path = defaultPath
-	}
-	if !strings.HasPrefix(path, "/") {
-		path = "/" + path
-	}
 	maxBuf := cfg.Profile.MaxOutstanding
 	if maxBuf <= 0 {
 		maxBuf = 256
 	}
 	in := &grpcInbound{frames: make(chan types.Frame, maxBuf), errors: make(chan error, 4)}
-	mux := http.NewServeMux()
-	mux.HandleFunc(path, in.handleRequest)
-	srv := &http.Server{Addr: cfg.Request.Metadata["grpc.listen"], Handler: mux}
-	in.server = srv
+	listen, err := normalizeGRPCEndpoint(cfg.Request.Metadata["grpc.listen"])
+	if err != nil {
+		return nil, adapter.Error{Adapter: adapterID, Code: adapter.ErrCodeConnect, Reason: "invalid grpc.listen", Err: err}
+	}
+	server := grpc.NewServer(grpc.ForceServerCodec(defaultCodec))
+	in.server = server
+	in.address = listen
+	server.RegisterService(&grpcServiceDesc, &grpcTransportHandler{inbound: in})
+	listener, err := net.Listen("tcp", listen)
+	if err != nil {
+		return nil, adapter.Error{Adapter: adapterID, Code: adapter.ErrCodeConnect, Reason: "grpc listen", Err: err}
+	}
+	in.listener = listener
 	go func() {
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := server.Serve(listener); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
 			select {
-			case in.errors <- adapter.Error{Adapter: adapterID, Code: adapter.ErrCodeTransport, Reason: "listen error", Err: err}:
+			case in.errors <- adapter.Error{Adapter: adapterID, Code: adapter.ErrCodeTransport, Reason: "serve error", Err: err}:
 			default:
 			}
 		}
-		close(in.errors)
 	}()
 	return in, nil
 }
@@ -95,63 +98,71 @@ func (a *Adapter) OpenOutbound(_ context.Context, cfg adapter.AdapterConfig) (ad
 	if cfg.Profile.ChunkSize > a.Capabilities().MaxSize {
 		return nil, adapter.Error{Adapter: adapterID, Code: adapter.ErrCodeUnsupported, Reason: fmt.Sprintf("chunk size exceeds max size %d", a.Capabilities().MaxSize), Err: nil}
 	}
-	path := cfg.Request.Metadata["grpc.path"]
-	if path == "" {
-		path = defaultPath
+	endpoint, err := normalizeGRPCEndpoint(a.upstream)
+	if err != nil {
+		return nil, adapter.Error{Adapter: adapterID, Code: adapter.ErrCodeConnect, Reason: "invalid grpc upstream", Err: err}
 	}
-	if !strings.HasPrefix(path, "/") {
-		path = "/" + path
+	conn, err := grpc.Dial(endpoint, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithDefaultCallOptions(grpc.ForceCodec(defaultCodec)))
+	if err != nil {
+		return nil, adapter.Error{Adapter: adapterID, Code: adapter.ErrCodeConnect, Reason: "grpc dial", Err: err}
 	}
-	return &grpcOutbound{endpoint: a.upstream, path: path, client: a.client}, nil
+	return &grpcOutbound{endpoint: endpoint, conn: conn}, nil
 }
 
 type grpcOutbound struct {
 	endpoint string
-	path     string
-	client   *http.Client
+	conn     *grpc.ClientConn
 }
 
 func (g *grpcOutbound) Send(_ context.Context, frame *types.Frame) error {
 	if g.endpoint == "" {
 		return adapter.Error{Adapter: adapterID, Code: adapter.ErrCodeConnect, Reason: "grpc upstream is empty", Err: nil}
 	}
-	if g.client == nil {
-		g.client = defaultClient
-	}
 	if frame == nil {
 		return adapter.Error{Adapter: adapterID, Code: adapter.ErrCodeTransport, Reason: "frame is nil", Err: nil}
 	}
-	reqURL := strings.TrimRight(g.endpoint, "/") + g.path
-	req, err := http.NewRequest(http.MethodPost, reqURL, bytes.NewBuffer(frame.Payload))
-	if err != nil {
-		return adapter.Error{Adapter: adapterID, Code: adapter.ErrCodeConnect, Reason: "build request", Err: err}
+	payload := append([]byte(nil), frame.Payload...)
+	request := &grpcFrame{
+		StreamID:  frame.StreamID,
+		SessionID: frame.SessionID,
+		Seq:       frame.Seq,
+		Offset:    frame.Offset,
+		Payload:   payload,
+		Last:      frame.Last,
+		CreatedAt: frame.CreatedAt.UnixNano(),
 	}
-	req.Header.Set("x-wctlib-stream", frame.StreamID)
-	req.Header.Set("x-wctlib-session", frame.SessionID)
-	req.Header.Set("x-wctlib-seq", strconv.FormatUint(frame.Seq, 10))
-	req.Header.Set("x-wctlib-offset", strconv.FormatInt(frame.Offset, 10))
-	if frame.Last {
-		req.Header.Set("x-wctlib-last", "1")
+	reply := new(grpcAck)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := g.conn.Invoke(ctx, grpcMethodPath, request, reply, grpc.ForceCodec(defaultCodec)); err != nil {
+		return adapter.Error{
+			Adapter: adapterID,
+			Code:    grpcStatusCode(err),
+			Reason:  "invoke error",
+			Err:     err,
+		}
 	}
-	resp, err := g.client.Do(req)
-	if err != nil {
-		return adapter.Error{Adapter: adapterID, Code: adapter.ErrCodeTransport, Reason: "post frame", Err: err}
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return adapter.Error{Adapter: adapterID, Code: adapter.ErrCodeTransport, Reason: fmt.Sprintf("status %d %s", resp.StatusCode, string(body)), Err: nil}
+	if !reply.Accepted {
+		return adapter.Error{Adapter: adapterID, Code: adapter.ErrCodeTransport, Reason: "frame rejected", Err: nil}
 	}
 	return nil
 }
 
 func (g *grpcOutbound) Flush(_ context.Context) error { return nil }
-func (g *grpcOutbound) Close(_ context.Context) error { return nil }
+func (g *grpcOutbound) Close(_ context.Context) error {
+	if g.conn == nil {
+		return nil
+	}
+	return g.conn.Close()
+}
 
 type grpcInbound struct {
-	frames chan types.Frame
-	errors chan error
-	server *http.Server
+	frames   chan types.Frame
+	errors   chan error
+	server   *grpc.Server
+	listener net.Listener
+	address  string
+	once     sync.Once
 }
 
 func (i *grpcInbound) Frames(_ context.Context) <-chan types.Frame { return i.frames }
@@ -160,41 +171,149 @@ func (i *grpcInbound) Ack(context.Context, uint64, int64) error {
 	return nil
 }
 func (i *grpcInbound) Close(_ context.Context) error {
-	err := i.server.Close()
-	close(i.errors)
+	var err error
+	i.once.Do(func() {
+		i.server.Stop()
+		if i.listener != nil {
+			_ = i.listener.Close()
+		}
+		close(i.errors)
+		close(i.frames)
+	})
 	return err
 }
-func (i *grpcInbound) handleRequest(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
+
+type grpcTransportHandler struct {
+	inbound *grpcInbound
+}
+
+type grpcTransportServer interface {
+	PushFrame(context.Context, *grpcFrame) (*grpcAck, error)
+}
+
+type grpcFrame struct {
+	StreamID  string `json:"stream_id"`
+	SessionID string `json:"session_id"`
+	Seq       uint64 `json:"seq"`
+	Offset    int64  `json:"offset"`
+	Last      bool   `json:"last"`
+	Payload   []byte `json:"payload"`
+	CreatedAt int64  `json:"created_at"`
+}
+
+type grpcAck struct {
+	Accepted bool `json:"accepted"`
+}
+
+type grpcJSONCodec struct{}
+
+func (grpcJSONCodec) Marshal(v interface{}) ([]byte, error) {
+	return json.Marshal(v)
+}
+
+func (grpcJSONCodec) Unmarshal(data []byte, v interface{}) error {
+	return json.Unmarshal(data, v)
+}
+
+func (grpcJSONCodec) Name() string { return "json-wctlib" }
+
+func (s *grpcTransportHandler) PushFrame(ctx context.Context, in *grpcFrame) (*grpcAck, error) {
+	if in == nil {
+		return nil, status.Error(codes.InvalidArgument, "empty frame")
 	}
-	headers := r.Header
-	seq, _ := strconv.ParseUint(headers.Get("x-wctlib-seq"), 10, 64)
-	offset, _ := strconv.ParseInt(headers.Get("x-wctlib-offset"), 10, 64)
-	payload, err := io.ReadAll(r.Body)
-	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		select {
-		case i.errors <- adapter.Error{Adapter: adapterID, Code: adapter.ErrCodeTransport, Reason: "read body", Err: err}:
-		default:
-		}
-		return
+	if in.StreamID == "" {
+		return nil, status.Error(codes.InvalidArgument, "missing stream id")
 	}
 	frame := types.Frame{
-		StreamID:  headers.Get("x-wctlib-stream"),
-		SessionID: headers.Get("x-wctlib-session"),
-		Seq:       seq,
-		Offset:    offset,
-		Payload:   payload,
+		StreamID:  in.StreamID,
+		SessionID: in.SessionID,
+		Seq:       in.Seq,
+		Offset:    in.Offset,
+		Payload:   in.Payload,
+		Last:      in.Last,
 	}
-	if headers.Get("x-wctlib-last") == "1" {
-		frame.Last = true
+	if in.CreatedAt > 0 {
+		frame.CreatedAt = time.Unix(0, in.CreatedAt)
 	}
 	select {
-	case i.frames <- frame:
-		w.WriteHeader(http.StatusNoContent)
-	default:
-		w.WriteHeader(http.StatusTooManyRequests)
+	case s.inbound.frames <- frame:
+		return &grpcAck{Accepted: true}, nil
+	case <-ctx.Done():
+		return nil, status.Error(codes.Canceled, "inbound canceled")
+	case <-time.After(250 * time.Millisecond):
+		return nil, status.Error(codes.Unavailable, "inbound queue full")
 	}
+}
+
+var grpcServiceDesc = grpc.ServiceDesc{
+	ServiceName: grpcServiceID,
+	HandlerType: (*grpcTransportServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "PushFrame",
+			Handler:    grpcUnaryPushFrameHandler,
+		},
+	},
+	Streams:  nil,
+	Metadata: "wctlib grpc transport",
+}
+
+func grpcUnaryPushFrameHandler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(grpcFrame)
+	if err := dec(in); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	if interceptor == nil {
+		return srv.(grpcTransportServer).PushFrame(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: grpcMethodPath,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(grpcTransportServer).PushFrame(ctx, req.(*grpcFrame))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func grpcStatusCode(err error) adapter.ErrorCode {
+	if err == nil {
+		return adapter.ErrCodeTransport
+	}
+	if st, ok := status.FromError(err); ok {
+		switch st.Code() {
+		case codes.Unavailable, codes.DeadlineExceeded:
+			return adapter.ErrCodeConnect
+		case codes.InvalidArgument:
+			return adapter.ErrCodeUnsupported
+		}
+	}
+	return adapter.ErrCodeTransport
+}
+
+func normalizeGRPCEndpoint(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", fmt.Errorf("empty endpoint")
+	}
+	if strings.HasPrefix(raw, "unix://") {
+		return "", errors.New("unix sockets are not supported")
+	}
+	if strings.Contains(raw, "://") {
+		parsed, err := url.Parse(raw)
+		if err != nil {
+			return "", err
+		}
+		if parsed.Scheme != "" && parsed.Scheme != "grpc" && parsed.Scheme != "http" && parsed.Scheme != "https" && parsed.Scheme != "grpcs" {
+			return "", fmt.Errorf("unsupported scheme: %s", parsed.Scheme)
+		}
+		if parsed.Scheme == "grpcs" {
+			return "", errors.New("grpcs scheme is currently unsupported")
+		}
+		raw = parsed.Host
+	}
+	if raw == "" {
+		return "", fmt.Errorf("invalid endpoint")
+	}
+	return raw, nil
 }

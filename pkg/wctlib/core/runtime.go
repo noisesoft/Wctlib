@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -63,8 +64,8 @@ func NewRuntime(cfg RuntimeConfig) (*Runtime, error) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	data := NewScheduler(cfg.DataWorkers)
-	control := NewScheduler(cfg.ControlWorkers)
+	data := NewSchedulerWithMetrics("data", cfg.DataWorkers, cfg.Metrics)
+	control := NewSchedulerWithMetrics("control", cfg.ControlWorkers, cfg.Metrics)
 	data.Start(ctx)
 	control.Start(ctx)
 
@@ -225,6 +226,20 @@ func (r *Runtime) StartSession(ctx context.Context, req types.StreamRequest) (*S
 		r.bufferPool,
 		r.metrics,
 		r.logger,
+		func(adapterID, reason string) {
+			r.registry.ReportFailure(adapterID)
+			r.metrics.Inc("runtime_session_failure_total", 1, telemetry.Labels{
+				"adapter":    adapterID,
+				"stream_id":  req.StreamID,
+				"session_id": sessionID,
+			})
+			r.metrics.LogEvent("runtime_session_failed", telemetry.Labels{
+				"adapter":    adapterID,
+				"stream_id":  req.StreamID,
+				"session_id": sessionID,
+				"reason":     reason,
+			})
+		},
 	)
 	session.adapterName = adapters.ID()
 
@@ -309,6 +324,14 @@ func (r *Runtime) pickAdapter(ctx context.Context, cfg adapter.AdapterConfig) (a
 			inbound, inErr := adapterImpl.OpenInbound(ctx, cfg)
 			if inErr != nil {
 				r.registry.ReportFailure(adapterImpl.ID())
+				r.metrics.Inc("runtime_adapter_open_error_total", 1, telemetry.Labels{
+					"adapter": adapterImpl.ID(),
+					"direction": "receive",
+				})
+				r.metrics.LogEvent("runtime_adapter_open_error", telemetry.Labels{
+					"adapter": adapterImpl.ID(),
+					"stream_id": cfg.StreamID,
+				})
 				lastErr = inErr
 				continue
 			}
@@ -319,10 +342,22 @@ func (r *Runtime) pickAdapter(ctx context.Context, cfg adapter.AdapterConfig) (a
 		outbound, outErr := adapterImpl.OpenOutbound(ctx, cfg)
 		if outErr != nil {
 			r.registry.ReportFailure(adapterImpl.ID())
+			r.metrics.Inc("runtime_adapter_open_error_total", 1, telemetry.Labels{
+				"adapter": adapterImpl.ID(),
+				"direction": "send",
+			})
+			r.metrics.LogEvent("runtime_adapter_open_error", telemetry.Labels{
+				"adapter": adapterImpl.ID(),
+				"stream_id": cfg.StreamID,
+			})
 			lastErr = outErr
 			continue
 		}
 		r.registry.ReportSuccess(adapterImpl.ID())
+		r.metrics.LogEvent("runtime_adapter_selected", telemetry.Labels{
+			"adapter": adapterImpl.ID(),
+			"stream_id": cfg.StreamID,
+		})
 		return adapterImpl, outbound, nil, nil
 	}
 	if lastErr == nil {
@@ -358,7 +393,20 @@ func orderProbeCandidates(preferred []string, probes []adapter.ProbeResult) []ad
 		}
 		ordered = append(ordered, probe)
 	}
+	sortSliceProbeResult(ordered)
 	return ordered
+}
+
+func sortSliceProbeResult(probes []adapter.ProbeResult) {
+	if len(probes) <= 1 {
+		return
+	}
+	sort.Slice(probes, func(i, j int) bool {
+		if probes[i].Score != probes[j].Score {
+			return probes[i].Score > probes[j].Score
+		}
+		return probes[i].AdapterID < probes[j].AdapterID
+	})
 }
 
 func (r *Runtime) runGC(ctx context.Context, interval time.Duration) {

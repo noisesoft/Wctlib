@@ -42,6 +42,7 @@ type StreamSession struct {
 	doneCh chan struct{}
 	errCh  chan error
 	cancel context.CancelFunc
+	notifyFailure func(adapterID string, reason string)
 
 	statsMu sync.RWMutex
 	stats   types.StreamStats
@@ -62,6 +63,7 @@ func newStreamSession(
 	buf *buffer.Pool,
 	metrics telemetry.MetricSink,
 	logger adapter.Logger,
+	onFailure func(adapterID string, reason string),
 ) *StreamSession {
 	return &StreamSession{
 		id:         id,
@@ -77,6 +79,7 @@ func newStreamSession(
 		buffer:     buf,
 		metrics:    metrics,
 		logger:     logger,
+		notifyFailure: onFailure,
 		state:      types.SessionStatePreparing,
 		doneCh:     make(chan struct{}),
 		errCh:      make(chan error, 4),
@@ -341,6 +344,9 @@ func (s *StreamSession) fail(err error) {
 		return
 	}
 	s.setState(types.SessionStateFailed)
+	if s.notifyFailure != nil {
+		s.notifyFailure(s.adapterName, err.Error())
+	}
 	s.lastErr.Store(&err)
 	s.updateState()
 	if s.logger != nil {

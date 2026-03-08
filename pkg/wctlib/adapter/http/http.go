@@ -3,10 +3,12 @@ package httpadapter
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/noisesoft/Wctlib/pkg/wctlib/adapter"
@@ -65,7 +67,7 @@ func (a *Adapter) OpenInbound(_ context.Context, cfg adapter.AdapterConfig) (ada
 	in.server = srv
 	go func() {
 		_ = srv.ListenAndServe()
-		close(in.errors)
+		in.Close(context.Background())
 	}()
 	return in, nil
 }
@@ -115,6 +117,7 @@ type httpInbound struct {
 	frames chan types.Frame
 	errors chan error
 	server *http.Server
+	once   sync.Once
 }
 
 func (i *httpInbound) Frames(_ context.Context) <-chan types.Frame { return i.frames }
@@ -123,8 +126,45 @@ func (i *httpInbound) Ack(context.Context, uint64, int64) error {
 	return nil
 }
 func (i *httpInbound) Close(_ context.Context) error {
-	err := i.server.Close()
+	var err error
+	i.once.Do(func() {
+		err = i.server.Close()
+		close(i.errors)
+		close(i.frames)
+	})
 	return err
+}
+
+func parseIntHeader(v string) (int64, error) {
+	if v == "" {
+		return 0, nil
+	}
+	value, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return value, nil
+}
+
+func parseUintHeader(v string) (uint64, error) {
+	if v == "" {
+		return 0, nil
+	}
+	value, err := strconv.ParseUint(v, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return value, nil
+}
+
+func (i *httpInbound) reportErr(reason string, err error) {
+	if err == nil {
+		return
+	}
+	select {
+	case i.errors <- adapter.Error{Adapter: adapterID, Code: adapter.ErrCodeTransport, Reason: reason, Err: err}:
+	default:
+	}
 }
 func (i *httpInbound) handleRequest(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -132,15 +172,17 @@ func (i *httpInbound) handleRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	headers := r.Header
-	seq, _ := strconv.ParseUint(headers.Get("x-wctlib-seq"), 10, 64)
-	offset, _ := strconv.ParseInt(headers.Get("x-wctlib-offset"), 10, 64)
+	seq, seqErr := parseUintHeader(headers.Get("x-wctlib-seq"))
+	offset, offErr := parseIntHeader(headers.Get("x-wctlib-offset"))
 	payload, err := io.ReadAll(r.Body)
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
-		select {
-		case i.errors <- adapter.Error{Adapter: adapterID, Code: adapter.ErrCodeTransport, Reason: "read body", Err: err}:
-		default:
-		}
+		i.reportErr("read body", err)
+		return
+	}
+	if seqErr != nil || offErr != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		i.reportErr("invalid frame header", errors.Join(seqErr, offErr))
 		return
 	}
 	frame := types.Frame{StreamID: headers.Get("x-wctlib-stream"), SessionID: headers.Get("x-wctlib-session"), Seq: seq, Offset: offset, Payload: payload}
